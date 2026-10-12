@@ -1,0 +1,704 @@
+import { call, tryCall } from '../api.js';
+import { COLOR_KEYS, COLOR_LABELS, normalizeSkin, makeSkinId, validateSkin,
+         loadImageFile, extractPalette, paletteToTheme } from '../theme.js';
+
+const HTML = `
+<div class="grid cols-2">
+  <div>
+    <div class="card">
+      <h2>个人档案</h2>
+      <div class="form-row"><label>昵称</label><input x-model="profile.nickname"></div>
+      <div class="form-row"><label>性别</label>
+        <select x-model="profile.sex">
+          <option value="">未设置</option><option value="male">男</option><option value="female">女</option>
+        </select>
+      </div>
+      <div class="form-row"><label>出生年份</label><input type="number" x-model="profile.birth_year" min="1930" max="2020"></div>
+      <div class="form-row"><label>身高 (cm)</label><input type="number" x-model="profile.height_cm" step="0.1"></div>
+      <div class="form-row"><label>体重 (kg)</label><input type="number" x-model="profile.weight_kg" step="0.1"></div>
+      <div class="form-row"><label>最大心率（Garmin 同步后可自动填充）</label><input type="number" x-model="profile.max_hr"></div>
+      <div class="form-row"><label>静息心率</label><input type="number" x-model="profile.rest_hr"></div>
+      <div class="form-row"><label>跑龄水平</label>
+        <select x-model="profile.run_experience">
+          <option value="beginner">初级</option>
+          <option value="intermediate">中级</option>
+          <option value="advanced">高级</option>
+        </select>
+      </div>
+      <div class="form-row"><label>VO2max（Garmin 同步自动更新）</label>
+        <input type="number" x-model="profile.vo2max" step="0.1" readonly>
+      </div>
+      <button class="btn primary" @click="saveProfile()">保存档案</button>
+    </div>
+
+    <div class="card">
+      <h2>AI 教练</h2>
+      <!-- 生效配置条：锁定态只读展示当前实际使用的模型 -->
+      <div class="ai-lockbar" :class="aiLocked ? 'locked' : 'editing'">
+        <div class="flex between gap8">
+          <div class="small">
+            <template x-if="aiLocked"><span class="badge soft">🔒 已确定</span></template>
+            <template x-if="!aiLocked"><span class="badge warn">✏️ 更改中（未生效）</span></template>
+            <template x-if="aiLocked">
+              <span>AI 教练使用：<b x-text="activeAiText()"></b></span>
+            </template>
+            <template x-if="aiLocked && aiWebSearch">
+              <span class="muted"> · 知识问答联网检索已开</span>
+            </template>
+          </div>
+          <button class="btn small" x-show="aiLocked" @click="unlockAi()">更改配置</button>
+        </div>
+      </div>
+      <template x-if="!aiLocked">
+        <div>
+          <div class="form-row">
+            <label>服务商</label>
+            <select x-model="aiProvider">
+              <template x-for="p in aiProviders" :key="p.key">
+                <option :value="p.key" :selected="p.key === aiProvider" x-text="p.label"></option>
+              </template>
+            </select>
+          </div>
+          <p class="muted mt8" x-text="aiHint()"></p>
+          <template x-if="provFreeText()">
+            <div class="form-row">
+              <label>模型（输入本地已拉取的模型名）</label>
+              <input x-model="aiModel" list="ai-model-suggest">
+              <datalist id="ai-model-suggest">
+                <template x-for="m in modelOptions()" :key="m"><option :value="m"></option></template>
+              </datalist>
+            </div>
+          </template>
+          <template x-if="!provFreeText()">
+            <div class="form-row">
+              <label>模型</label>
+              <select x-model="aiModel">
+                <template x-for="m in modelOptions()" :key="m">
+                  <!-- :selected 显式跟随状态：x-model 初始化先于 x-for 渲染 option，
+                       不加会出现「显示第一项(4.7)、状态仍是旧值(5.3)」→ 确定把旧值写回 -->
+                  <option :value="m" :selected="m === aiModel" x-text="modelLabel(m)"></option>
+                </template>
+              </select>
+            </div>
+          </template>
+          <template x-if="provNeedsKey() && !hasAiKey()">
+            <div class="form-row">
+              <label>API Key（存于 Windows 凭据管理器，不落盘）</label>
+              <div class="flex">
+                <input type="password" :placeholder="keyPlaceholder()" x-model="aiKey" style="flex:1">
+                <button class="btn small" @click="pasteInto('aiKey')">📋 粘贴</button>
+              </div>
+            </div>
+          </template>
+          <p class="muted small" x-show="provNeedsKey() && hasAiKey()">
+            该服务商 Key 已保存在 Windows 凭据管理器，无需重复输入；需要更换 Key 时先在下面清除再粘贴。
+          </p>
+          <div class="flex gap8">
+            <button class="btn primary" @click="confirmAi()">确定（保存并锁定）</button>
+            <button class="btn" @click="cancelAiEdit()">放弃更改</button>
+            <button class="btn" x-show="hasAiKey()" @click="clearAiKey()">清除已存 Key</button>
+          </div>
+        </div>
+      </template>
+      <div class="form-row" x-show="aiProvider === 'zhipu'">
+        <label class="flex">
+          <input type="checkbox" style="width:auto" x-model="aiWebSearch" @change="saveAiWebSearch()">
+          <span>知识类问题联网检索（约 ¥0.01/次；让教练用最新运动科学研究/数据作答，而不是只靠内置知识）</span>
+        </label>
+      </div>
+      <p class="muted mt8">AI 选择需「确定」后锁定生效，之后想改须手动点「更改配置」再重新确定；教练每天最多自动调用一次，知识类提问联网检索为可选增量。Mock 模式下完全由本地样例模拟，不消耗任何服务商额度。</p>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Garmin 数据同步</h2>
+      <template x-if="!hasGarminPassword">
+        <div>
+          <div class="form-row"><label>Garmin Connect 账号</label><input x-model="garminUsername"></div>
+          <div class="form-row"><label>密码</label>
+            <div class="flex">
+              <input type="password" x-model="garminPassword" style="flex:1">
+              <button class="btn small" @click="pasteInto('garminPassword')">📋 粘贴</button>
+            </div>
+          </div>
+          <div class="flex">
+            <button class="btn primary" @click="saveGarmin()" :disabled="!garminUsername || !garminPassword">保存账号</button>
+          </div>
+        </div>
+      </template>
+      <template x-if="hasGarminPassword">
+        <div>
+          <p>已配置账号：<b x-text="garminUsername"></b>
+            <span class="muted" x-show="profile.nickname">（<span x-text="profile.nickname"></span>）</span></p>
+          <div class="flex mt8">
+            <button class="btn primary" @click="syncNow()" :disabled="syncing">
+              <span x-text="syncing ? '同步中…' : '立即同步'"></span>
+            </button>
+            <button class="btn" @click="clearGarmin()">清除账号</button>
+          </div>
+        </div>
+      </template>
+      <div class="form-row mt8">
+        <label class="flex">
+          <input type="checkbox" style="width:auto" x-model="garminCn" @change="saveGarminCn()">
+          <span>中国区账号（connect.garmin.cn 独立服务器）</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label class="flex">
+          <input type="checkbox" style="width:auto" x-model="autoSyncEnabled" @change="saveAutoSync()">
+          <span>自动同步（应用开着时每 5 分钟拉取 Garmin 新数据，成绩预测与心率对照表自动刷新）</span>
+        </label>
+      </div>
+      <p class="muted mt8">官方 Health API 暂不接受新申请，本应用通过账号凭据自动拉取数据；若同步失败可随时手动导入 FIT 文件。</p>
+    </div>
+
+    <div class="card">
+      <h2>同步状态</h2>
+      <table>
+        <thead><tr><th>来源</th><th>上次同步</th><th>状态</th><th>本次结果</th></tr></thead>
+        <tbody>
+          <template x-for="s in syncStates" :key="s.source">
+            <tr>
+              <td x-text="s.source"></td>
+              <td class="num" x-text="fmtTs(s.last_sync_ts)"></td>
+              <td>
+                <span class="status-pair" :class="s.last_error ? 'st-critical' : 'st-good'">
+                  <span class="dot" :style="dotStyle(s.last_error)"></span>
+                  <span x-text="s.last_error ? '失败' : '正常'"></span>
+                </span>
+                <p class="muted" x-show="s.last_error" x-text="s.last_error"></p>
+              </td>
+              <td class="muted" x-text="statsText(s)"></td>
+            </tr>
+          </template>
+          <tr x-show="!syncStates.length"><td colspan="4" class="muted">暂无同步记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>外观与开发者选项</h2>
+      <div class="form-row"><label>基础主题</label>
+        <select x-model="theme" @change="saveTheme()">
+          <option value="system">跟随系统</option>
+          <option value="light">亮色</option>
+          <option value="dark">暗色</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label class="flex">
+          <input type="checkbox" style="width:auto" x-model="mockMode" @change="saveMockMode()">
+          <span>Mock 模式（用样例数据替代 Garmin / DeepSeek，便于演示开发）</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>主题皮肤</h2>
+      <p class="muted" style="margin:0 0 10px">上传一张图片作背景并自动取色，或手动调色，命名保存为自己的皮肤；可导出/导入分享。</p>
+
+      <template x-if="$store.app.skins.length">
+        <div class="skin-list">
+          <template x-for="s in $store.app.skins" :key="s.id">
+            <div class="skin-item" :class="{ active: s.id === $store.app.activeSkin }">
+              <div class="skin-swatches">
+                <span class="sw" :style="'background:' + s.colors.accent"></span>
+                <span class="sw" :style="'background:' + s.colors.bg"></span>
+                <span class="sw" :style="'background:' + s.colors['bg-card']"></span>
+                <span class="sw" :style="'background:' + s.colors.text"></span>
+              </div>
+              <span class="skin-name" x-text="s.name"></span>
+              <button class="btn small" @click="applySkin(s.id)">应用</button>
+              <button class="btn small" @click="editSkin(s)">编辑</button>
+              <button class="btn small" @click="exportSkin(s)">导出</button>
+              <button class="btn small" @click="deleteSkin(s.id)">删除</button>
+            </div>
+          </template>
+        </div>
+      </template>
+      <p class="muted" x-show="!$store.app.skins.length" style="margin:0 0 10px">还没有自定义皮肤。</p>
+
+      <div class="flex gap8">
+        <button class="btn primary" @click="newSkin()">＋ 新建皮肤</button>
+        <button class="btn" @click="importSkinClick()">导入皮肤</button>
+      </div>
+      <input type="file" accept=".json,application/json" x-ref="skinFile" style="display:none" @change="onSkinFile($event)">
+
+      <template x-if="skinEditor">
+        <div class="skin-editor">
+          <h3 x-text="skinIsNew() ? '新建皮肤' : '编辑皮肤'"></h3>
+          <div class="form-row"><label>皮肤名称</label><input x-model="skinEditor.name"></div>
+
+          <div class="form-row">
+            <label>背景壁纸</label>
+            <div class="flex gap8">
+              <button class="btn small" @click="$refs.bgFile.click()">上传图片（背景 + 自动取色）</button>
+              <button class="btn small" x-show="skinEditor.background" @click="removeBackground()">移除背景</button>
+            </div>
+            <input type="file" accept="image/*" x-ref="bgFile" style="display:none" @change="pickBackground($event)">
+          </div>
+          <div class="form-row" x-show="skinEditor.background">
+            <label>遮罩强度 <span x-text="Math.round(skinEditor.overlay * 100) + '%'"></span></label>
+            <input type="range" min="0.2" max="1" step="0.01" x-model="skinEditor.overlay" @input="previewSkin()">
+          </div>
+
+          <div class="form-row">
+            <label>配色（改动即时预览）</label>
+            <div class="color-grid">
+              <template x-for="k in colorKeys" :key="k">
+                <label class="color-cell">
+                  <input type="color" :value="skinEditor.colors[k]" @input="setColor(k, $event.target.value)">
+                  <span x-text="colorLabels[k]"></span>
+                </label>
+              </template>
+            </div>
+          </div>
+
+          <div class="form-row"><label>圆角</label>
+            <select x-model="skinEditor.layout.radius" @change="previewSkin()">
+              <option value="mech">机械直角</option>
+              <option value="round">圆润</option>
+            </select>
+          </div>
+          <div class="form-row"><label>侧栏宽度</label>
+            <select x-model="skinEditor.layout.sidebar" @change="previewSkin()">
+              <option value="compact">紧凑</option>
+              <option value="standard">标准</option>
+              <option value="wide">宽松</option>
+            </select>
+          </div>
+          <div class="form-row"><label>密度</label>
+            <select x-model="skinEditor.layout.density" @change="previewSkin()">
+              <option value="compact">紧凑</option>
+              <option value="normal">标准</option>
+              <option value="comfy">宽松</option>
+            </select>
+          </div>
+
+          <div class="flex gap8">
+            <button class="btn primary" @click="saveSkin()">保存皮肤</button>
+            <button class="btn" @click="cancelSkinEdit()">取消</button>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <div class="card">
+      <h2>手机伴侣屏</h2>
+      <p class="muted mt8" style="margin-top:0">
+        开启后，与之连同一个 Wi-Fi 的手机浏览器可打开另一半界面：今日概览、AI 教练裁决与对话。
+        服务只在本机运行，需用 6 位配对码连接，连续输错会临时锁定。
+      </p>
+      <div class="form-row">
+        <label class="flex">
+          <input type="checkbox" style="width:auto" x-model="companionEnabled" @change="saveCompanion()">
+          <span>开启手机伴侣屏（局域网 8088 端口）</span>
+        </label>
+      </div>
+      <template x-if="companionEnabled">
+        <div>
+          <p class="muted" x-show="!companionRunning">
+            服务未在运行<span x-show="companionError" x-text="'：' + companionError"></span>
+          </p>
+          <div x-show="companionRunning">
+            <p>手机浏览器打开（手机需连同一个 Wi-Fi）：</p>
+            <ul>
+              <template x-for="u in companionUrls" :key="u">
+                <li><b x-text="u"></b></li>
+              </template>
+            </ul>
+            <p class="muted" x-show="!companionUrls.length">
+              未检测到局域网地址，请确认电脑已连上 Wi-Fi 或网线。
+            </p>
+            <div class="form-row">
+              <label>配对码</label>
+              <div class="flex">
+                <input readonly :value="companionPin" style="flex:1; letter-spacing:3px; font-size:18px">
+                <button class="btn small" @click="resetCompanionPin()">重置</button>
+              </div>
+            </div>
+            <p class="muted mt8">
+              在手机页面输入这 6 位数字即可连接。重置后已配对的手机需重新输入，重启应用不必重新配对。
+            </p>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>`;
+
+export function initSettings() {
+  const sec = document.getElementById('page-settings');
+  sec.innerHTML = HTML;
+
+  window.Alpine.data('settingsPage', () => ({
+    profile: { nickname: '', sex: '', birth_year: null, height_cm: null, weight_kg: null, max_hr: null, rest_hr: null, run_experience: 'intermediate' },
+    garminUsername: '',
+    garminPassword: '',
+    hasGarminPassword: false,
+    garminCn: true,
+    autoSyncEnabled: true,
+    aiProvider: 'deepseek',
+    aiProviders: [],
+    aiKeys: {},
+    aiKey: '',
+    aiModel: 'deepseek-v4-pro',
+    theme: 'system',
+    skinEditor: null,   // 正在编辑的皮肤草稿（null = 关闭编辑器）
+    colorKeys: COLOR_KEYS,
+    colorLabels: COLOR_LABELS,
+    mockMode: true,
+    aiWebSearch: false,
+    syncStates: [],
+    syncing: false,
+    aiLocked: true,  // AI 选择确定后锁定；更改需手动解锁（任务：确定/锁定流）
+    companionEnabled: false,
+    companionRunning: false,
+    companionUrls: [],
+    companionPin: '',
+    companionError: '',
+
+    async init() {
+      const { ok, data, error } = await tryCall('get_settings');
+      if (!ok) { this.$dispatch('toast', { text: '读取设置失败: ' + error }); return; }
+      this.profile = { ...this.profile, ...(data.profile || {}) };
+      this.garminUsername = data.garmin_username || '';
+      this.hasGarminPassword = data.has_garmin_password;
+      this.garminCn = data.garmin_cn;
+      this.autoSyncEnabled = data.auto_sync_enabled;
+      this.aiProvider = data.ai_provider || 'deepseek';
+      this.aiProviders = data.ai_providers || [];
+      this.aiKeys = data.ai_keys || {};
+      this.aiModel = data.ai_model;
+      this.theme = data.theme;
+      if (Array.isArray(data.theme_skins)) this.$store.app.skins = data.theme_skins.map(normalizeSkin);
+      this.$store.app.activeSkin = data.active_skin || '';
+      this.mockMode = data.mock_mode;
+      this.aiWebSearch = data.ai_web_search;
+      this.syncStates = data.sync_states || [];
+      this.aiLocked = true;
+      this.loadCompanion();
+    },
+    // 切到设置页时刷新（同步状态/档案可能已变化；也兜底启动时 init 未跑成的情况）。
+    // 编辑中（已解锁）不重跑 init：sync-done 会刷新所有页，重跑会把草稿静默
+    // 重置回库里的旧模型并重新上锁 → 用户随后点确定的又是旧值
+    async shown() { if (this.aiLocked) await this.init(); },
+
+    async pasteInto(field) {
+      const { ok, data, error } = await tryCall('read_clipboard');
+      if (!ok || !data || !data.text) { this.$dispatch('toast', { text: '剪贴板无文本内容' }); return; }
+      this[field] = data.text;
+      this.$dispatch('toast', { text: '已从剪贴板粘贴' });
+    },
+
+    dotStyle(err) { return `background: ${err ? 'var(--st-critical)' : 'var(--st-good)'}`; },
+    statsText(s) {
+      const st = (s.meta && s.meta.last_stats) || {};
+      if (!st.activities && !st.health_days && !st.plan_rebuilt && !st.health_backfill
+        && !st.auto_analysis) return '—';
+      const parts = [];
+      if (st.activities) parts.push(`活动 +${st.activities}`);
+      if (st.health_days) parts.push(`健康 ${st.health_days} 天`);
+      if (st.health_backfill) parts.push(st.health_backfill);
+      if (st.health_error) parts.push(`健康本轮未拉到`);
+      if (st.plan_rebuilt) parts.push(`课表已按 VDOT ${st.plan_vdot} 更新`);
+      if (st.mock_purged) parts.push(`清理演示数据 ${st.mock_purged} 条`);
+      if (st.auto_analysis) parts.push(`📊 ${st.auto_analysis}`);
+      if (st.auto_analysis_error) parts.push(st.auto_analysis_error);
+      return parts.join('，');
+    },
+    fmtTs(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts * 1000);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    },
+
+    async saveProfile() {
+      const { ok, error } = await tryCall('save_profile', this.profile);
+      if (!ok) { this.$dispatch('toast', { text: '保存失败: ' + error }); return; }
+      this.$dispatch('toast', { text: '档案已保存' });
+      // 静息心率/最大心率/体重等参与 HRR 分量、心率区、恢复度与教练上下文
+      // → 其余页面（仪表盘水平预估/日历活动分类）立即用新档案重算
+      window.dispatchEvent(new Event('data-changed'));
+    },
+    async saveGarmin() {
+      const { ok, error } = await tryCall('save_garmin_credentials', this.garminUsername, this.garminPassword);
+      if (!ok) { this.$dispatch('toast', { text: '保存失败: ' + error }); return; }
+      this.hasGarminPassword = true;
+      this.garminPassword = '';
+      this.$dispatch('toast', { text: 'Garmin 账号已保存' });
+    },
+    async clearGarmin() {
+      await tryCall('clear_garmin_credentials');
+      this.hasGarminPassword = false;
+      this.garminUsername = '';
+      this.$dispatch('toast', { text: '账号已清除' });
+    },
+    async syncNow() {
+      this.syncing = true;
+      const { ok, error } = await tryCall('sync_garmin');
+      if (!ok) { this.syncing = false; this.$dispatch('toast', { text: '同步失败: ' + error }); return; }
+      // 同步在后台线程执行：轮询 sync_state，等 last_sync_ts 变化即本次尝试结束
+      const before = (this.syncStates.find(s => s.source === 'garmin') || {}).last_sync_ts || 0;
+      const deadline = Date.now() + 120000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const s = await tryCall('get_sync_states');
+        if (!s.ok) continue;
+        const row = (s.data || []).find((x) => x.source === 'garmin');
+        if (!row) continue;
+        this.syncStates = s.data;
+        if ((row.last_sync_ts || 0) !== before) {
+          this.syncing = false;
+          if (row.last_error) { this.$dispatch('toast', { text: '同步失败: ' + row.last_error }); }
+          else {
+            this.$dispatch('toast', { text: '同步完成：' + this.statsText(row), ms: 4000 });
+            this.$dispatch('sync-done');
+          }
+          await this.init();
+          return;
+        }
+      }
+      this.syncing = false;
+      this.$dispatch('toast', { text: '同步超时（仍在进行），请稍后查看同步状态表' });
+    },
+    // ---- AI 服务商（确定/锁定流：选择不即时生效，点「确定」一次性提交并锁定）----
+    provInfo() { return (this.aiProviders || []).find((p) => p.key === this.aiProvider) || null; },
+    provNeedsKey() { const p = this.provInfo(); return !!(p && p.needs_key); },
+    provFreeText() { const p = this.provInfo(); return !!(p && p.free_text); },
+    modelOptions() { const p = this.provInfo(); return (p && p.models) || []; },
+    modelLabel(m) {
+      const d = {
+        'deepseek-v4-pro': 'deepseek-v4-pro（推理更强，推荐）',
+        'deepseek-v4-flash': 'deepseek-v4-flash（便宜快速）',
+        'glm-4.7-flash': 'glm-4.7-flash（免费 · 已关思考，回复快，默认）',
+        'glm-5.3-flash': 'glm-5.3-flash（免费 · 思考常开，更聪明但明显更慢）',
+      };
+      return d[m] || m;
+    },
+    // 教练页展示用：服务商标签 + 模型说明（读本地设置，不上 API）
+    activeAiText() {
+      const p = this.provInfo();
+      const base = (p ? p.label : this.aiProvider) + ' · ' + this.modelLabel(this.aiModel);
+      return this.mockMode ? base + '（Mock 模式）' : base;
+    },
+    aiHint() { const p = this.provInfo(); return p ? p.hint : ''; },
+    keyPlaceholder() {
+      return this.aiProvider === 'deepseek' ? 'sk-...（platform.deepseek.com 获取）' : 'API Key（服务商控制台获取）';
+    },
+    hasAiKey() { return !!(this.aiKeys || {})[this.aiProvider]; },
+    unlockAi() {
+      this.aiKey = '';
+      this.aiLocked = false;
+      this.$dispatch('toast', { text: '已解锁：修改后点「确定（保存并锁定）」生效' });
+    },
+    async cancelAiEdit() {
+      this.aiLocked = true;
+      await this.init();  // 放弃草稿：从本地配置读回已生效值
+      this.$dispatch('toast', { text: '已放弃更改，仍使用原配置' });
+    },
+    async confirmAi() {
+      const info = this.provInfo();
+      // 需要 Key 且本地没有 → 先要求粘贴，避免 provider/model 先落库却没锁定的半提交
+      if (info && info.needs_key && !this.hasAiKey() && !this.aiKey) {
+        this.$dispatch('toast', { text: `「${info.label}」需要 API Key：粘贴后再次确定，或换免费/本地方案` });
+        return;
+      }
+      const r = await tryCall('set_setting', 'ai_provider', this.aiProvider);
+      if (!r.ok) { this.$dispatch('toast', { text: '切换失败: ' + r.error }); return; }
+      // 模型名不在新服务商候选列表时，落到其默认模型并保存（与后端回落逻辑一致）
+      if (info && info.models && info.models.length && !info.models.includes(this.aiModel)) {
+        this.aiModel = info.models[0];
+      }
+      const m = await tryCall('set_setting', 'ai_model', this.aiModel);
+      if (!m.ok) { this.$dispatch('toast', { text: '模型保存失败: ' + m.error }); return; }
+      if (info && info.needs_key && !this.hasAiKey()) {
+        const k = await tryCall('save_ai_key', this.aiProvider, this.aiKey);
+        if (!k.ok) { this.$dispatch('toast', { text: 'Key 保存失败: ' + k.error }); return; }
+        this.aiKeys = { ...this.aiKeys, [this.aiProvider]: true };
+        this.aiKey = '';
+      }
+      // 读回后端实值再展示/锁定（曾有下拉显示 4.7、库里实际存 5.3 的分裂：
+      // 锁定条若回显前端内存值会把「以为保存了 4.7」当成功）
+      const s = await tryCall('get_settings');
+      if (s.ok && s.data) {
+        this.aiProvider = s.data.ai_provider || this.aiProvider;
+        if (s.data.ai_model) this.aiModel = s.data.ai_model;
+        this.aiKeys = s.data.ai_keys || this.aiKeys;
+        this.mockMode = s.data.mock_mode;
+      }
+      this.aiLocked = true;
+      this.$dispatch('ai-config-changed');
+      this.$dispatch('toast', { text: '已确定并锁定：' + this.activeAiText(), ms: 3500 });
+    },
+    async clearAiKey() {
+      const { ok, error } = await tryCall('clear_ai_key', this.aiProvider);
+      if (!ok) { this.$dispatch('toast', { text: '清除失败: ' + error }); return; }
+      this.aiKeys = { ...this.aiKeys, [this.aiProvider]: false };
+      this.$dispatch('toast', { text: 'Key 已清除' });
+    },
+    async saveTheme() {
+      await tryCall('set_setting', 'theme', this.theme);
+      await tryCall('set_setting', 'active_skin', '');  // 切回基础模式即退出自定义皮肤
+      this.$dispatch('theme-changed', { theme: this.theme });
+    },
+    // ---- 主题皮肤 ----
+    skinIsNew() {
+      return !this.skinEditor || !this.$store.app.skins.some((s) => s.id === this.skinEditor.id);
+    },
+    previewSkin() {
+      if (this.skinEditor) this.$store.app.applySkin(this.skinEditor);
+    },
+    setColor(k, v) {
+      this.skinEditor.colors[k] = v;
+      this.previewSkin();
+    },
+    newSkin() {
+      this.skinEditor = normalizeSkin({});
+      this.previewSkin();
+    },
+    editSkin(s) {
+      this.skinEditor = normalizeSkin(JSON.parse(JSON.stringify(s)));
+      this.previewSkin();
+    },
+    cancelSkinEdit() {
+      this.skinEditor = null;
+      this.$store.app.applyTheme();  // 恢复当前激活皮肤 / 基础模式
+    },
+    async pickBackground(ev) {
+      const file = ev.target.files && ev.target.files[0];
+      ev.target.value = '';  // 允许重复选同一文件
+      if (!file) return;
+      try {
+        const { imageData, dataUrl } = await loadImageFile(file);
+        const theme = paletteToTheme(extractPalette(imageData));
+        if (theme) {
+          this.skinEditor.mode = theme.mode;
+          this.skinEditor.colors = theme.colors;
+        }
+        this.skinEditor.background = dataUrl;
+        this.previewSkin();
+        this.$dispatch('toast', { text: '已生成背景与配色，可继续微调' });
+      } catch (e) {
+        this.$dispatch('toast', { text: '图片处理失败: ' + e.message });
+      }
+    },
+    removeBackground() {
+      this.skinEditor.background = '';
+      this.previewSkin();
+    },
+    async applySkin(id) {
+      this.$store.app.setActiveSkin(id);
+      await tryCall('set_setting', 'active_skin', id);
+    },
+    async saveSkin() {
+      const name = (this.skinEditor.name || '').trim();
+      if (!name) { this.$dispatch('toast', { text: '请先给皮肤命名' }); return; }
+      const skin = normalizeSkin(this.skinEditor);
+      skin.name = name;
+      if (this.$store.app.skins.some((s) => s.name === name && s.id !== skin.id)) {
+        this.$dispatch('toast', { text: '已存在同名皮肤，请换个名字' });
+        return;
+      }
+      const exists = this.$store.app.skins.some((s) => s.id === skin.id);
+      const list = exists
+        ? this.$store.app.skins.map((s) => (s.id === skin.id ? skin : s))
+        : [...this.$store.app.skins, skin];
+      if (list.length > 20) { this.$dispatch('toast', { text: '皮肤数量已达上限 20' }); return; }
+      const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
+      if (!r.ok) { this.$dispatch('toast', { text: '保存失败: ' + r.error }); return; }
+      this.$store.app.skins = list;
+      this.skinEditor = null;
+      await this.applySkin(skin.id);
+      this.$dispatch('toast', { text: '皮肤已保存：' + skin.name });
+    },
+    async deleteSkin(id) {
+      const list = this.$store.app.skins.filter((s) => s.id !== id);
+      const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
+      if (!r.ok) { this.$dispatch('toast', { text: '删除失败: ' + r.error }); return; }
+      this.$store.app.skins = list;
+      if (this.$store.app.activeSkin === id) {
+        this.$store.app.setActiveSkin('');
+        await tryCall('set_setting', 'active_skin', '');
+      }
+      this.$dispatch('toast', { text: '皮肤已删除' });
+    },
+    async exportSkin(s) {
+      const r = await tryCall('export_theme_skin', JSON.stringify(s, null, 2), (s.name || 'skin') + '.json');
+      if (!r.ok) { this.$dispatch('toast', { text: '导出失败: ' + r.error }); return; }
+      this.$dispatch('toast', { text: '已导出皮肤：' + s.name });
+    },
+    importSkinClick() {
+      this.$refs.skinFile.click();
+    },
+    async onSkinFile(ev) {
+      const file = ev.target.files && ev.target.files[0];
+      ev.target.value = '';
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const obj = JSON.parse(text);
+        if (!validateSkin(obj)) { this.$dispatch('toast', { text: '皮肤文件格式不正确' }); return; }
+        const skin = normalizeSkin(obj);
+        skin.id = makeSkinId();  // 导入重新分配 id，避免与现有皮肤冲突
+        if (this.$store.app.skins.some((s) => s.name === skin.name)) skin.name += '（导入）';
+        const list = [...this.$store.app.skins, skin];
+        if (list.length > 20) { this.$dispatch('toast', { text: '皮肤数量已达上限 20' }); return; }
+        const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
+        if (!r.ok) { this.$dispatch('toast', { text: '导入失败: ' + r.error }); return; }
+        this.$store.app.skins = list;
+        await this.applySkin(skin.id);
+        this.$dispatch('toast', { text: '已导入皮肤：' + skin.name });
+      } catch (e) {
+        this.$dispatch('toast', { text: '导入失败: ' + e.message });
+      }
+    },
+    async saveMockMode() { await tryCall('set_setting', 'mock_mode', this.mockMode ? '1' : '0'); },
+    async saveAiWebSearch() {
+      await tryCall('set_setting', 'ai_web_search', this.aiWebSearch ? '1' : '0');
+      this.$dispatch('toast', { text: this.aiWebSearch ? '已开启联网检索（知识类问题生效）' : '已关闭联网检索' });
+    },
+    async saveGarminCn() { await tryCall('set_setting', 'garmin_cn', this.garminCn ? '1' : '0'); },
+    async saveAutoSync() {
+      await tryCall('set_setting', 'auto_sync_enabled', this.autoSyncEnabled ? '1' : '0');
+      this.$dispatch('toast', { text: this.autoSyncEnabled ? '已开启自动同步（每 5 分钟）' : '已关闭自动同步' });
+    },
+
+    // ---- 手机伴侣屏 ----
+    applyCompanion(data) {
+      if (!data) return;
+      this.companionEnabled = !!data.enabled;
+      this.companionRunning = !!data.running;
+      this.companionUrls = data.urls || [];
+      this.companionPin = data.pin || '';
+      this.companionError = data.error || '';
+    },
+    // 挂在 init() 末尾：失败只静默（老版本后端没有这几个接口时不能让整页读设置失败）
+    async loadCompanion() {
+      const { ok, data } = await tryCall('get_companion_status');
+      if (ok) this.applyCompanion(data);
+    },
+    async saveCompanion() {
+      const want = this.companionEnabled;
+      const { ok, data, error } = await tryCall('set_companion_enabled', want);
+      if (!ok) {
+        this.companionEnabled = !want;  // 起不来就把勾拨回去，别让界面显示已开启
+        this.$dispatch('toast', { text: '启动失败: ' + error, ms: 5000 });
+        return;
+      }
+      this.applyCompanion(data);
+      this.$dispatch('toast', {
+        text: want ? '手机伴侣屏已开启，用手机浏览器打开上面的地址' : '手机伴侣屏已关闭',
+        ms: 4000,
+      });
+    },
+    async resetCompanionPin() {
+      const { ok, data, error } = await tryCall('reset_companion_pin');
+      if (!ok) { this.$dispatch('toast', { text: '重置失败: ' + error }); return; }
+      this.applyCompanion(data);
+      this.$dispatch('toast', { text: '配对码已重置，手机需重新输入' });
+    },
+  }));
+}

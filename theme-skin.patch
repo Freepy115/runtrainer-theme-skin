@@ -1,0 +1,803 @@
+diff --git a/src/runtrainer/api/bridge.py b/src/runtrainer/api/bridge.py
+index fc35aac..3e95a6b 100644
+--- a/src/runtrainer/api/bridge.py
++++ b/src/runtrainer/api/bridge.py
+@@ -78,6 +78,8 @@ class Api:
+             "ai_keys": {k: bool(settings_service.get_ai_key(k)) for k in PROVIDERS},
+             "ai_model": settings_service.get_ai_model(),
+             "theme": settings_service.get_theme(),
++            "theme_skins": settings_service.get_theme_skins(),
++            "active_skin": settings_service.get_active_skin(),
+             "mock_mode": settings_service.is_mock_mode(),
+             "ai_web_search": settings_service.get_ai_web_search(),
+             "garmin_cn": settings_service.is_garmin_cn(),
+@@ -134,6 +136,12 @@ class Api:
+             settings_service.set_ai_provider(value)
+         elif key == "theme":
+             settings_service.set_theme(value)
++        elif key == "theme_skins":
++            from ..utils import jsonutil
++            skins = jsonutil.loads(value) or []
++            settings_service.set_theme_skins(skins if isinstance(skins, list) else [])
++        elif key == "active_skin":
++            settings_service.set_active_skin(value)
+         elif key == "mock_mode":
+             settings_service.set_mock_mode(value == "1")
+         elif key == "ai_web_search":
+@@ -486,6 +494,26 @@ class Api:
+         )
+         return list(result) if result else []
+ 
++    @envelope
++    def export_theme_skin(self, contents: str, default_name: str = "theme-skin.json"):
++        """导出主题皮肤：弹保存对话框，把 JSON 内容写入所选路径。"""
++        import webview
++        if not webview.windows:
++            raise RuntimeError("窗口未就绪")
++        # pywebview 6.x：OPEN/SAVE/FOLDER_DIALOG 常量已弃用，改用 FileDialog 枚举
++        save_type = getattr(webview, "FileDialog", None)
++        dialog_type = save_type.SAVE if save_type else getattr(webview, "SAVE_DIALOG", 30)
++        result = webview.windows[0].create_file_dialog(
++            dialog_type, save_filename=default_name,
++            file_types=("主题皮肤 (*.json)", "所有文件 (*.*)"),
++        )
++        if not result:
++            return {"cancelled": True}
++        path = result[0] if isinstance(result, (list, tuple)) else result
++        with open(str(path), "w", encoding="utf-8") as f:
++            f.write(contents)
++        return {"path": str(path)}
++
+     # ---- 手动补录活动 ----
+     @envelope
+     def add_manual_activity(self, payload: dict):
+diff --git a/src/runtrainer/services/settings_service.py b/src/runtrainer/services/settings_service.py
+index 391b3b2..490d103 100644
+--- a/src/runtrainer/services/settings_service.py
++++ b/src/runtrainer/services/settings_service.py
+@@ -19,6 +19,8 @@ K_AI_KEY_PREFIX = "ai_key_"             # 新版按服务商隔离：ai_key_{pro
+ 
+ # 非敏感 KV 键
+ S_THEME = "theme"
++S_THEME_SKINS = "theme_skins"  # 自定义主题皮肤列表（JSON 数组，含背景图 base64）
++S_ACTIVE_SKIN = "active_skin"  # 当前激活皮肤：""=跟随基础 theme，内置名或自定义皮肤 id
+ S_AI_MODEL = "ai_model"
+ S_AI_PROVIDER = "ai_provider"
+ S_MOCK_MODE = "mock_mode"
+@@ -128,6 +130,27 @@ def set_theme(theme: str) -> None:
+     kv_repo.set_setting(S_THEME, theme)
+ 
+ 
++def get_theme_skins() -> list:
++    """自定义主题皮肤列表（含背景图 base64 的 JSON 数组）。"""
++    from ..utils import jsonutil
++    skins = jsonutil.loads(kv_repo.get_setting(S_THEME_SKINS)) or []
++    return skins if isinstance(skins, list) else []
++
++
++def set_theme_skins(skins: list) -> None:
++    from ..utils import jsonutil
++    kv_repo.set_setting(S_THEME_SKINS, jsonutil.dumps(skins))
++
++
++def get_active_skin() -> str:
++    """当前激活皮肤："" = 跟随基础 theme（system/light/dark）。"""
++    return kv_repo.get_setting(S_ACTIVE_SKIN, "") or ""
++
++
++def set_active_skin(skin_id: str) -> None:
++    kv_repo.set_setting(S_ACTIVE_SKIN, skin_id or "")
++
++
+ def is_mock_mode() -> bool:
+     return kv_repo.get_setting(S_MOCK_MODE, "1") == "1"
+ 
+diff --git a/web/css/app.css b/web/css/app.css
+index e832ddf..feee937 100644
+--- a/web/css/app.css
++++ b/web/css/app.css
+@@ -1,6 +1,8 @@
+ ﻿/* ============ 设计令牌 ============ */
+ :root {
+   --font: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
++  --sidebar-w: 200px;   /* 侧栏宽度（布局令牌，data-sidebar 覆盖） */
++  --overlay: 1;         /* 卡片/侧栏不透明度遮罩 0~1；背景壁纸下 <1 透出背景 */
+ 
+   /* 训练类型固定色（勿随筛选重排） */
+   --kind-e: #2a78d6;
+@@ -69,7 +71,11 @@
+ html, body { height: 100%; }
+ body {
+   font-family: var(--font);
+-  background: var(--bg);
++  background-color: var(--bg);
++  background-size: cover;
++  background-position: center;
++  background-repeat: no-repeat;
++  background-attachment: fixed;
+   color: var(--text);
+   display: flex;
+   overflow: hidden;
+@@ -81,9 +87,9 @@ button { font-family: inherit; cursor: pointer; }
+ 
+ /* ============ 布局 ============ */
+ .sidebar {
+-  width: 200px;
++  width: var(--sidebar-w, 200px);
+   flex-shrink: 0;
+-  background: var(--bg-card);
++  background: color-mix(in srgb, var(--bg-card) calc(var(--overlay, 1) * 100%), transparent);
+   border-right: 1px solid var(--border);
+   display: flex;
+   flex-direction: column;
+@@ -111,7 +117,7 @@ button { font-family: inherit; cursor: pointer; }
+ 
+ /* ============ 组件 ============ */
+ .card {
+-  background: var(--bg-card);
++  background: color-mix(in srgb, var(--bg-card) calc(var(--overlay, 1) * 100%), transparent);
+   border: 1px solid var(--border);
+   border-radius: 8px;
+   padding: 16px;
+@@ -735,3 +741,58 @@ table th { border-bottom: 1.5px solid var(--border-strong); }
+ .vdt-mx tbody tr:hover { background: var(--bg-hover); }
+ .vdt-mx tbody tr.cur { background: color-mix(in srgb, var(--accent) 15%, transparent); font-weight: 700; }
+ .vdt-mx tbody tr.cur td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
++
++/* ============ 可定制布局覆盖层（主题皮肤 data-radius / data-sidebar / data-density） ============ */
++[data-sidebar="compact"] { --sidebar-w: 180px; }
++[data-sidebar="wide"] { --sidebar-w: 240px; }
++
++[data-density="compact"] .card { padding: 10px; margin-bottom: 10px; }
++[data-density="compact"] .form-row { margin-bottom: 8px; }
++[data-density="comfy"] .card { padding: 22px; margin-bottom: 22px; }
++[data-density="comfy"] .form-row { margin-bottom: 18px; }
++
++/* 圆润观感：覆盖「机械风」层的 2–4px 小圆角 */
++[data-radius="round"] .card { border-radius: 12px; }
++[data-radius="round"] .btn { border-radius: 8px; }
++[data-radius="round"] input,
++[data-radius="round"] select,
++[data-radius="round"] textarea { border-radius: 8px; }
++[data-radius="round"] .sidebar nav a { border-radius: 8px; }
++[data-radius="round"] .sidebar nav a.active::before { display: none; }
++[data-radius="round"] .banner { border-radius: 10px; }
++[data-radius="round"] .toast { border-radius: 10px; }
++[data-radius="round"] .badge { border-radius: 6px; }
++[data-radius="round"] .stat { border-radius: 8px; }
++[data-radius="round"] .modal { border-radius: 12px; }
++[data-radius="round"] .chat-bubble { border-radius: 12px; }
++[data-radius="round"] .calendar .day { border-radius: 8px; }
++[data-radius="round"] .progress,
++[data-radius="round"] .progress-fill { border-radius: 999px; }
++[data-radius="round"] .vdt-scroll,
++[data-radius="round"] .vdt-z,
++[data-radius="round"] .vdt-chip { border-radius: 8px; }
++
++/* ============ 主题皮肤编辑器（设置页） ============ */
++.skin-list { display: flex; flex-direction: column; gap: 8px; }
++.skin-item {
++  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
++  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
++  background: var(--bg-hover);
++}
++.skin-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
++.skin-swatches { display: flex; gap: 3px; }
++.skin-swatches .sw { width: 16px; height: 16px; border-radius: 3px; border: 1px solid var(--border); }
++.skin-name { flex: 1; font-weight: 600; min-width: 80px; }
++.skin-editor {
++  margin-top: 14px; padding: 14px;
++  border: 1px solid var(--border); border-radius: 8px;
++  background: var(--bg-hover);
++}
++.skin-editor h3 { margin-bottom: 12px; }
++.color-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
++.color-cell { display: flex; align-items: center; gap: 6px; cursor: pointer; }
++.color-cell input[type=color] {
++  width: 34px; height: 26px; padding: 0; border: 1px solid var(--border);
++  border-radius: 4px; background: none; cursor: pointer; flex-shrink: 0;
++}
++.color-cell span { font-size: 12px; color: var(--text-muted); }
+diff --git a/web/index.html b/web/index.html
+index 8312342..5a11d98 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -9,7 +9,7 @@
+   <script defer src="vendor/echarts.min.js"></script>
+   <script type="module" src="js/main.js"></script>
+ </head>
+-<body x-data="{}" :data-theme="$store.app.effectiveTheme"
++<body x-data="{}"
+       @toast.window="$store.app.showToast($event.detail.text)"
+       @theme-changed.window="$store.app.setTheme($event.detail.theme)">
+   <aside class="sidebar">
+diff --git a/web/js/main.js b/web/js/main.js
+index 8b3375f..809d33b 100644
+--- a/web/js/main.js
++++ b/web/js/main.js
+@@ -6,6 +6,7 @@ import { initGoal } from './pages/goal.js';
+ import { initHealth } from './pages/health.js';
+ import { initSettings } from './pages/settings.js';
+ import { initVdot } from './pages/vdot.js';
++import { COLOR_KEYS, normalizeSkin } from './theme.js';
+ 
+ const PAGES = ['dashboard', 'calendar', 'goal', 'coach', 'activities', 'health', 'vdot', 'settings'];
+ 
+@@ -16,6 +17,8 @@ function registerStore() {
+   const store = {
+     page: 'settings',
+     theme: localStorage.getItem('runtrainer-theme') || 'dark',
++    skins: [],       // 自定义主题皮肤列表（后端 kv 载入）
++    activeSkin: '',  // 当前激活皮肤 id（'' = 跟随基础 theme）
+     toast: { show: false, text: '' },
+     syncBanner: '',
+     get effectiveTheme() {
+@@ -23,12 +26,45 @@ function registerStore() {
+         ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+         : this.theme;
+     },
++    get currentSkin() {
++      return this.skins.find((s) => s.id === this.activeSkin) || null;
++    },
++    clearCustomTheme() {
++      const root = document.documentElement;
++      for (const k of COLOR_KEYS) root.style.removeProperty('--' + k);
++      root.style.removeProperty('--overlay');
++      document.body.style.backgroundImage = '';
++      delete root.dataset.radius;
++      delete root.dataset.sidebar;
++      delete root.dataset.density;
++    },
++    applySkin(skin) {
++      const root = document.documentElement;
++      root.dataset.theme = skin.mode || 'dark';
++      for (const k of COLOR_KEYS) root.style.setProperty('--' + k, skin.colors[k]);
++      root.style.setProperty('--overlay', String(skin.overlay ?? 0.82));
++      document.body.style.backgroundImage = skin.background ? `url("${skin.background}")` : '';
++      const l = skin.layout || {};
++      root.dataset.radius = l.radius || 'mech';
++      root.dataset.sidebar = l.sidebar || 'standard';
++      root.dataset.density = l.density || 'normal';
++    },
+     applyTheme() {
++      this.clearCustomTheme();
++      if (this.activeSkin && this.currentSkin) {
++        this.applySkin(this.currentSkin);
++        return;
++      }
+       document.documentElement.dataset.theme = this.effectiveTheme;
+     },
+     setTheme(t) {
+       this.theme = t;
+       localStorage.setItem('runtrainer-theme', t);
++      this.activeSkin = '';  // 切回基础模式即退出自定义皮肤
++      this.applyTheme();
++    },
++    setActiveSkin(id) {
++      this.activeSkin = id || '';
+       this.applyTheme();
+     },
+     toggleTheme() {
+@@ -73,12 +109,16 @@ function registerPages() {
+ }
+ 
+ async function loadBackendPrefs(store) {
+-  // 主题以后端设置为准（设置页保存到后端）；无后端值时保持默认暗色
++  // 主题与自定义皮肤以后端设置为准（设置页保存到后端）；无后端值时保持默认暗色
+   try {
+     const { call } = await import('./api.js');
+     const data = await call('get_settings');
+-    if (data && data.theme) store.setTheme(data.theme);
+-  } catch (e) { /* 后端不可用时维持本地主题 */ }
++    if (!data) { store.applyTheme(); return; }
++    store.skins = Array.isArray(data.theme_skins) ? data.theme_skins.map(normalizeSkin) : [];
++    if (data.theme) { store.theme = data.theme; localStorage.setItem('runtrainer-theme', data.theme); }
++    store.activeSkin = data.active_skin || '';
++    store.applyTheme();
++  } catch (e) { store.applyTheme(); }
+ }
+ 
+ // 自动同步：启动时拉一次 + 运行期间每 5 分钟一轮（受设置页开关控制）。
+diff --git a/web/js/pages/settings.js b/web/js/pages/settings.js
+index 5de0749..410104b 100644
+--- a/web/js/pages/settings.js
++++ b/web/js/pages/settings.js
+@@ -1,4 +1,6 @@
+ import { call, tryCall } from '../api.js';
++import { COLOR_KEYS, COLOR_LABELS, normalizeSkin, makeSkinId, validateSkin,
++         loadImageFile, extractPalette, paletteToTheme } from '../theme.js';
+ 
+ const HTML = `
+ <div class="grid cols-2">
+@@ -178,7 +180,7 @@ const HTML = `
+ 
+     <div class="card">
+       <h2>外观与开发者选项</h2>
+-      <div class="form-row"><label>主题</label>
++      <div class="form-row"><label>基础主题</label>
+         <select x-model="theme" @change="saveTheme()">
+           <option value="system">跟随系统</option>
+           <option value="light">亮色</option>
+@@ -193,6 +195,96 @@ const HTML = `
+       </div>
+     </div>
+ 
++    <div class="card">
++      <h2>主题皮肤</h2>
++      <p class="muted" style="margin:0 0 10px">上传一张图片作背景并自动取色，或手动调色，命名保存为自己的皮肤；可导出/导入分享。</p>
++
++      <template x-if="$store.app.skins.length">
++        <div class="skin-list">
++          <template x-for="s in $store.app.skins" :key="s.id">
++            <div class="skin-item" :class="{ active: s.id === $store.app.activeSkin }">
++              <div class="skin-swatches">
++                <span class="sw" :style="'background:' + s.colors.accent"></span>
++                <span class="sw" :style="'background:' + s.colors.bg"></span>
++                <span class="sw" :style="'background:' + s.colors['bg-card']"></span>
++                <span class="sw" :style="'background:' + s.colors.text"></span>
++              </div>
++              <span class="skin-name" x-text="s.name"></span>
++              <button class="btn small" @click="applySkin(s.id)">应用</button>
++              <button class="btn small" @click="editSkin(s)">编辑</button>
++              <button class="btn small" @click="exportSkin(s)">导出</button>
++              <button class="btn small" @click="deleteSkin(s.id)">删除</button>
++            </div>
++          </template>
++        </div>
++      </template>
++      <p class="muted" x-show="!$store.app.skins.length" style="margin:0 0 10px">还没有自定义皮肤。</p>
++
++      <div class="flex gap8">
++        <button class="btn primary" @click="newSkin()">＋ 新建皮肤</button>
++        <button class="btn" @click="importSkinClick()">导入皮肤</button>
++      </div>
++      <input type="file" accept=".json,application/json" x-ref="skinFile" style="display:none" @change="onSkinFile($event)">
++
++      <template x-if="skinEditor">
++        <div class="skin-editor">
++          <h3 x-text="skinIsNew() ? '新建皮肤' : '编辑皮肤'"></h3>
++          <div class="form-row"><label>皮肤名称</label><input x-model="skinEditor.name"></div>
++
++          <div class="form-row">
++            <label>背景壁纸</label>
++            <div class="flex gap8">
++              <button class="btn small" @click="$refs.bgFile.click()">上传图片（背景 + 自动取色）</button>
++              <button class="btn small" x-show="skinEditor.background" @click="removeBackground()">移除背景</button>
++            </div>
++            <input type="file" accept="image/*" x-ref="bgFile" style="display:none" @change="pickBackground($event)">
++          </div>
++          <div class="form-row" x-show="skinEditor.background">
++            <label>遮罩强度 <span x-text="Math.round(skinEditor.overlay * 100) + '%'"></span></label>
++            <input type="range" min="0.2" max="1" step="0.01" x-model="skinEditor.overlay" @input="previewSkin()">
++          </div>
++
++          <div class="form-row">
++            <label>配色（改动即时预览）</label>
++            <div class="color-grid">
++              <template x-for="k in colorKeys" :key="k">
++                <label class="color-cell">
++                  <input type="color" :value="skinEditor.colors[k]" @input="setColor(k, $event.target.value)">
++                  <span x-text="colorLabels[k]"></span>
++                </label>
++              </template>
++            </div>
++          </div>
++
++          <div class="form-row"><label>圆角</label>
++            <select x-model="skinEditor.layout.radius" @change="previewSkin()">
++              <option value="mech">机械直角</option>
++              <option value="round">圆润</option>
++            </select>
++          </div>
++          <div class="form-row"><label>侧栏宽度</label>
++            <select x-model="skinEditor.layout.sidebar" @change="previewSkin()">
++              <option value="compact">紧凑</option>
++              <option value="standard">标准</option>
++              <option value="wide">宽松</option>
++            </select>
++          </div>
++          <div class="form-row"><label>密度</label>
++            <select x-model="skinEditor.layout.density" @change="previewSkin()">
++              <option value="compact">紧凑</option>
++              <option value="normal">标准</option>
++              <option value="comfy">宽松</option>
++            </select>
++          </div>
++
++          <div class="flex gap8">
++            <button class="btn primary" @click="saveSkin()">保存皮肤</button>
++            <button class="btn" @click="cancelSkinEdit()">取消</button>
++          </div>
++        </div>
++      </template>
++    </div>
++
+     <div class="card">
+       <h2>手机伴侣屏</h2>
+       <p class="muted mt8" style="margin-top:0">
+@@ -254,6 +346,9 @@ export function initSettings() {
+     aiKey: '',
+     aiModel: 'deepseek-v4-pro',
+     theme: 'system',
++    skinEditor: null,   // 正在编辑的皮肤草稿（null = 关闭编辑器）
++    colorKeys: COLOR_KEYS,
++    colorLabels: COLOR_LABELS,
+     mockMode: true,
+     aiWebSearch: false,
+     syncStates: [],
+@@ -278,6 +373,8 @@ export function initSettings() {
+       this.aiKeys = data.ai_keys || {};
+       this.aiModel = data.ai_model;
+       this.theme = data.theme;
++      if (Array.isArray(data.theme_skins)) this.$store.app.skins = data.theme_skins.map(normalizeSkin);
++      this.$store.app.activeSkin = data.active_skin || '';
+       this.mockMode = data.mock_mode;
+       this.aiWebSearch = data.ai_web_search;
+       this.syncStates = data.sync_states || [];
+@@ -444,8 +541,120 @@ export function initSettings() {
+     },
+     async saveTheme() {
+       await tryCall('set_setting', 'theme', this.theme);
++      await tryCall('set_setting', 'active_skin', '');  // 切回基础模式即退出自定义皮肤
+       this.$dispatch('theme-changed', { theme: this.theme });
+     },
++    // ---- 主题皮肤 ----
++    skinIsNew() {
++      return !this.skinEditor || !this.$store.app.skins.some((s) => s.id === this.skinEditor.id);
++    },
++    previewSkin() {
++      if (this.skinEditor) this.$store.app.applySkin(this.skinEditor);
++    },
++    setColor(k, v) {
++      this.skinEditor.colors[k] = v;
++      this.previewSkin();
++    },
++    newSkin() {
++      this.skinEditor = normalizeSkin({});
++      this.previewSkin();
++    },
++    editSkin(s) {
++      this.skinEditor = normalizeSkin(JSON.parse(JSON.stringify(s)));
++      this.previewSkin();
++    },
++    cancelSkinEdit() {
++      this.skinEditor = null;
++      this.$store.app.applyTheme();  // 恢复当前激活皮肤 / 基础模式
++    },
++    async pickBackground(ev) {
++      const file = ev.target.files && ev.target.files[0];
++      ev.target.value = '';  // 允许重复选同一文件
++      if (!file) return;
++      try {
++        const { imageData, dataUrl } = await loadImageFile(file);
++        const theme = paletteToTheme(extractPalette(imageData));
++        if (theme) {
++          this.skinEditor.mode = theme.mode;
++          this.skinEditor.colors = theme.colors;
++        }
++        this.skinEditor.background = dataUrl;
++        this.previewSkin();
++        this.$dispatch('toast', { text: '已生成背景与配色，可继续微调' });
++      } catch (e) {
++        this.$dispatch('toast', { text: '图片处理失败: ' + e.message });
++      }
++    },
++    removeBackground() {
++      this.skinEditor.background = '';
++      this.previewSkin();
++    },
++    async applySkin(id) {
++      this.$store.app.setActiveSkin(id);
++      await tryCall('set_setting', 'active_skin', id);
++    },
++    async saveSkin() {
++      const name = (this.skinEditor.name || '').trim();
++      if (!name) { this.$dispatch('toast', { text: '请先给皮肤命名' }); return; }
++      const skin = normalizeSkin(this.skinEditor);
++      skin.name = name;
++      if (this.$store.app.skins.some((s) => s.name === name && s.id !== skin.id)) {
++        this.$dispatch('toast', { text: '已存在同名皮肤，请换个名字' });
++        return;
++      }
++      const exists = this.$store.app.skins.some((s) => s.id === skin.id);
++      const list = exists
++        ? this.$store.app.skins.map((s) => (s.id === skin.id ? skin : s))
++        : [...this.$store.app.skins, skin];
++      if (list.length > 20) { this.$dispatch('toast', { text: '皮肤数量已达上限 20' }); return; }
++      const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
++      if (!r.ok) { this.$dispatch('toast', { text: '保存失败: ' + r.error }); return; }
++      this.$store.app.skins = list;
++      this.skinEditor = null;
++      await this.applySkin(skin.id);
++      this.$dispatch('toast', { text: '皮肤已保存：' + skin.name });
++    },
++    async deleteSkin(id) {
++      const list = this.$store.app.skins.filter((s) => s.id !== id);
++      const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
++      if (!r.ok) { this.$dispatch('toast', { text: '删除失败: ' + r.error }); return; }
++      this.$store.app.skins = list;
++      if (this.$store.app.activeSkin === id) {
++        this.$store.app.setActiveSkin('');
++        await tryCall('set_setting', 'active_skin', '');
++      }
++      this.$dispatch('toast', { text: '皮肤已删除' });
++    },
++    async exportSkin(s) {
++      const r = await tryCall('export_theme_skin', JSON.stringify(s, null, 2), (s.name || 'skin') + '.json');
++      if (!r.ok) { this.$dispatch('toast', { text: '导出失败: ' + r.error }); return; }
++      this.$dispatch('toast', { text: '已导出皮肤：' + s.name });
++    },
++    importSkinClick() {
++      this.$refs.skinFile.click();
++    },
++    async onSkinFile(ev) {
++      const file = ev.target.files && ev.target.files[0];
++      ev.target.value = '';
++      if (!file) return;
++      try {
++        const text = await file.text();
++        const obj = JSON.parse(text);
++        if (!validateSkin(obj)) { this.$dispatch('toast', { text: '皮肤文件格式不正确' }); return; }
++        const skin = normalizeSkin(obj);
++        skin.id = makeSkinId();  // 导入重新分配 id，避免与现有皮肤冲突
++        if (this.$store.app.skins.some((s) => s.name === skin.name)) skin.name += '（导入）';
++        const list = [...this.$store.app.skins, skin];
++        if (list.length > 20) { this.$dispatch('toast', { text: '皮肤数量已达上限 20' }); return; }
++        const r = await tryCall('set_setting', 'theme_skins', JSON.stringify(list));
++        if (!r.ok) { this.$dispatch('toast', { text: '导入失败: ' + r.error }); return; }
++        this.$store.app.skins = list;
++        await this.applySkin(skin.id);
++        this.$dispatch('toast', { text: '已导入皮肤：' + skin.name });
++      } catch (e) {
++        this.$dispatch('toast', { text: '导入失败: ' + e.message });
++      }
++    },
+     async saveMockMode() { await tryCall('set_setting', 'mock_mode', this.mockMode ? '1' : '0'); },
+     async saveAiWebSearch() {
+       await tryCall('set_setting', 'ai_web_search', this.aiWebSearch ? '1' : '0');
+diff --git a/web/js/theme.js b/web/js/theme.js
+new file mode 100644
+index 0000000..a0a11b1
+--- /dev/null
++++ b/web/js/theme.js
+@@ -0,0 +1,240 @@
++// 主题皮肤核心：颜色工具、图片压缩、取色算法、皮肤规范化。
++// 纯函数/无副作用（除 loadImageFile 依赖 DOM 的 canvas/FileReader），便于单测。
++
++export const COLOR_KEYS = [
++  'accent', 'accent-soft', 'bg', 'bg-card', 'bg-hover',
++  'text', 'text-muted', 'border', 'gridline',
++];
++
++export const COLOR_LABELS = {
++  'accent': '主色', 'accent-soft': '主色浅底', 'bg': '背景', 'bg-card': '卡片',
++  'bg-hover': '悬停', 'text': '文字', 'text-muted': '次要文字', 'border': '边框', 'gridline': '网格线',
++};
++
++// 内置黑红暗色主题的 9 色（与 app.css [data-theme="dark"] 一致），手动调色的默认起点
++export const DEFAULT_COLORS = {
++  'accent': '#e03131', 'accent-soft': '#2e1418', 'bg': '#0b0b0e',
++  'bg-card': '#16161c', 'bg-hover': '#20202a', 'text': '#e8e8ee',
++  'text-muted': '#8a8a96', 'border': '#2a2a34', 'gridline': '#22222b',
++};
++
++const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
++
++// ---- 颜色工具 ----
++export function hexToRgb(hex) {
++  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
++  if (!m) return null;
++  const n = parseInt(m[1], 16);
++  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
++}
++
++export function rgbToHex({ r, g, b }) {
++  const c = (v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0');
++  return '#' + c(r) + c(g) + c(b);
++}
++
++export function rgbToHsl({ r, g, b }) {
++  r /= 255; g /= 255; b /= 255;
++  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
++  const l = (mx + mn) / 2;
++  if (mx === mn) return { h: 0, s: 0, l };
++  const d = mx - mn;
++  const s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
++  let h;
++  if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
++  else if (mx === g) h = (b - r) / d + 2;
++  else h = (r - g) / d + 4;
++  return { h: h * 60, s, l };
++}
++
++export function hslToRgb({ h, s, l }) {
++  h = ((h % 360) + 360) % 360;
++  const c = (1 - Math.abs(2 * l - 1)) * s;
++  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
++  const m = l - c / 2;
++  let r, g, b;
++  if (h < 60) [r, g, b] = [c, x, 0];
++  else if (h < 120) [r, g, b] = [x, c, 0];
++  else if (h < 180) [r, g, b] = [0, c, x];
++  else if (h < 240) [r, g, b] = [0, x, c];
++  else if (h < 300) [r, g, b] = [x, 0, c];
++  else [r, g, b] = [c, 0, x];
++  return { r: Math.round((r + m) * 255), g: Math.round((g + m) * 255), b: Math.round((b + m) * 255) };
++}
++
++export function relLuminance({ r, g, b }) {
++  const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
++  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
++}
++
++export function contrastRatio(a, b) {
++  const la = relLuminance(a), lb = relLuminance(b);
++  const hi = Math.max(la, lb), lo = Math.min(la, lb);
++  return (hi + 0.05) / (lo + 0.05);
++}
++
++// t: 0→a，1→b
++export function mix(a, b, t) {
++  return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t };
++}
++
++export function saturation({ r, g, b }) {
++  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
++  return mx === 0 ? 0 : (mx - mn) / mx;
++}
++
++// ---- 图片加载与压缩 ----
++function readFileAsDataURL(file) {
++  return new Promise((resolve, reject) => {
++    const fr = new FileReader();
++    fr.onload = () => resolve(fr.result);
++    fr.onerror = () => reject(new Error('读取文件失败'));
++    fr.readAsDataURL(file);
++  });
++}
++
++function loadImage(src) {
++  return new Promise((resolve, reject) => {
++    const img = new Image();
++    img.onload = () => resolve(img);
++    img.onerror = () => reject(new Error('图片加载失败'));
++    img.src = src;
++  });
++}
++
++const MAX_BG_BYTES = 512 * 1024; // 单张背景 data URL 上限，超限自动降质防 kv 膨胀
++
++/**
++ * 读图片文件 → 缩到最长边 maxEdge → 返回 { imageData, dataUrl, width, height }。
++ * imageData 保留 alpha（取色时忽略透明像素）；dataUrl 为压缩后的 JPEG（背景用）。
++ */
++export async function loadImageFile(file, { maxEdge = 1600, quality = 0.82 } = {}) {
++  const rawUrl = await readFileAsDataURL(file);
++  const img = await loadImage(rawUrl);
++  const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
++  const w = Math.max(1, Math.round(img.naturalWidth * scale));
++  const h = Math.max(1, Math.round(img.naturalHeight * scale));
++  const canvas = document.createElement('canvas');
++  canvas.width = w; canvas.height = h;
++  const ctx = canvas.getContext('2d');
++  ctx.drawImage(img, 0, 0, w, h);
++  const imageData = ctx.getImageData(0, 0, w, h); // 先取（含 alpha），再转 JPEG
++  let dataUrl = canvas.toDataURL('image/jpeg', quality);
++  let q = quality;
++  while (dataUrl.length > MAX_BG_BYTES && q > 0.4) {
++    q -= 0.1;
++    dataUrl = canvas.toDataURL('image/jpeg', q);
++  }
++  return { imageData, dataUrl, width: w, height: h };
++}
++
++// ---- 取色 ----
++/** 颜色量化：RGB 每通道 4 档（64 桶）统计频次，返回高频桶均色（按频次降序）。 */
++export function extractPalette(imageData, maxColors = 8) {
++  const { data } = imageData;
++  const buckets = new Map();
++  for (let i = 0; i < data.length; i += 4) {
++    if (data[i + 3] < 125) continue; // 忽略近透明像素
++    const r = data[i], g = data[i + 1], b = data[i + 2];
++    const key = ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
++    let bkt = buckets.get(key);
++    if (!bkt) { bkt = { r: 0, g: 0, b: 0, n: 0 }; buckets.set(key, bkt); }
++    bkt.r += r; bkt.g += g; bkt.b += b; bkt.n += 1;
++  }
++  if (!buckets.size) return [];
++  return [...buckets.values()]
++    .map((b) => ({ r: Math.round(b.r / b.n), g: Math.round(b.g / b.n), b: Math.round(b.b / b.n), n: b.n }))
++    .sort((a, b) => b.n - a.n)
++    .slice(0, maxColors);
++}
++
++function tuneAccent(accent, mode) {
++  const hsl = rgbToHsl(accent);
++  const s = Math.max(0.5, hsl.s);
++  // 主色作为按钮底色，按钮文字恒为白：亮度保持在中低区间保证白字可读
++  const l = mode === 'dark' ? clamp(hsl.l, 0.28, 0.5) : clamp(hsl.l, 0.22, 0.4);
++  return hslToRgb({ h: hsl.h, s, l });
++}
++
++function pushBg(bg, mode) {
++  const hsl = rgbToHsl(bg);
++  // 背景去饱和、压向近黑/近白，只保留图片色相的一丝余韵，避免整屏大红大绿
++  const s = Math.min(hsl.s, mode === 'dark' ? 0.35 : 0.25);
++  const l = mode === 'dark' ? clamp(hsl.l, 0.04, 0.12) : clamp(hsl.l, 0.93, 0.98);
++  return hslToRgb({ h: hsl.h, s, l });
++}
++
++/** 把主色列表映射为一套完整主题配色（9 色 + mode）。 */
++export function paletteToTheme(swatches) {
++  if (!swatches || !swatches.length) return null;
++  const avgL = swatches.reduce((s, c) => s + relLuminance(c), 0) / swatches.length;
++  const mode = avgL > 0.45 ? 'light' : 'dark';
++
++  const bySat = [...swatches].sort((a, b) => saturation(b) - saturation(a));
++  const accent = tuneAccent(bySat[0], mode);
++
++  const byLum = [...swatches].sort((a, b) => relLuminance(a) - relLuminance(b));
++  const bg = pushBg(mode === 'dark' ? byLum[0] : byLum[byLum.length - 1], mode);
++
++  const text = mode === 'dark' ? { r: 235, g: 235, b: 240 } : { r: 30, g: 28, b: 26 };
++  const bgCard = mix(bg, text, mode === 'dark' ? 0.05 : 0.04);
++  const bgHover = mix(bg, text, mode === 'dark' ? 0.1 : 0.08);
++  const border = mix(bg, text, mode === 'dark' ? 0.16 : 0.14);
++  const textMuted = mix(text, bg, 0.35);
++  const accentSoft = mix(accent, bg, 0.88);
++
++  return {
++    mode,
++    colors: {
++      'accent': rgbToHex(accent),
++      'accent-soft': rgbToHex(accentSoft),
++      'bg': rgbToHex(bg),
++      'bg-card': rgbToHex(bgCard),
++      'bg-hover': rgbToHex(bgHover),
++      'text': rgbToHex(text),
++      'text-muted': rgbToHex(textMuted),
++      'border': rgbToHex(border),
++      'gridline': rgbToHex(border),
++    },
++  };
++}
++
++// ---- 皮肤规范化（新建/导入统一入口） ----
++export function makeSkinId() {
++  return 'sk_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
++}
++
++export function isValidHex(hex) { return !!hexToRgb(hex); }
++
++export function validateSkin(skin) {
++  if (!skin || typeof skin !== 'object') return false;
++  if (typeof skin.name !== 'string' || !skin.name.trim()) return false;
++  const c = skin.colors;
++  if (!c || typeof c !== 'object') return false;
++  return COLOR_KEYS.every((k) => typeof c[k] === 'string' && isValidHex(c[k]));
++}
++
++/** 规范化皮肤：补默认色、生成 id、校验 layout，返回可安全存取的皮肤对象。 */
++export function normalizeSkin(skin) {
++  const src = (skin && typeof skin === 'object') ? skin : {};
++  const colors = {};
++  for (const k of COLOR_KEYS) {
++    colors[k] = isValidHex(src.colors && src.colors[k]) ? src.colors[k] : DEFAULT_COLORS[k];
++  }
++  const pick = (arr, v, d) => (arr.includes(v) ? v : d);
++  return {
++    id: (typeof src.id === 'string' && src.id) || makeSkinId(),
++    name: (typeof src.name === 'string' && src.name.trim()) || '未命名皮肤',
++    mode: src.mode === 'light' ? 'light' : 'dark',
++    background: (typeof src.background === 'string' && src.background.startsWith('data:image'))
++      ? src.background : '',
++    overlay: (typeof src.overlay === 'number' && isFinite(src.overlay))
++      ? clamp(src.overlay, 0.2, 1) : 0.82,
++    colors,
++    layout: {
++      radius: pick(['mech', 'round'], src.layout && src.layout.radius, 'mech'),
++      sidebar: pick(['compact', 'standard', 'wide'], src.layout && src.layout.sidebar, 'standard'),
++      density: pick(['compact', 'normal', 'comfy'], src.layout && src.layout.density, 'normal'),
++    },
++  };
++}
